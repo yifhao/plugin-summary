@@ -66,7 +66,7 @@ func getSummaryDataJson() ([]byte, error) {
 	var summaryData []byte
 	var err error
 	Summary.doWithDataReadLock(func() {
-		summaryData, err = json.Marshal(Summary.Data)
+		summaryData, err = json.Marshal(Summary.ServerSummaryData)
 	})
 	return summaryData, err
 }
@@ -78,7 +78,7 @@ type ServerSummary struct {
 	reportChan chan *ServerSummaryData
 
 	dataRwLock sync.RWMutex
-	Data       ServerSummaryData
+	ServerSummaryData
 }
 
 // ServerSummaryData 系统摘要定义
@@ -135,8 +135,8 @@ func (s *ServerSummary) StartSummary() {
 			if atomic.LoadInt64(&s.ref) > 0 {
 				data := Summary.collect()
 				s.doWithDataWriteLock(func() {
-					data.Children = s.Data.Children
-					s.Data = data
+					data.Children = s.Children
+					s.ServerSummaryData = data
 				})
 			}
 		case v := <-s.control:
@@ -149,7 +149,7 @@ func (s *ServerSummary) StartSummary() {
 					}
 				} else {
 					if atomic.AddInt64(&s.ref, -1) == 0 {
-						s.Data.lastNetWork = nil
+						s.ServerSummaryData.lastNetWork = nil
 						log.Println("stop report summary")
 						summary = false
 					}
@@ -158,7 +158,7 @@ func (s *ServerSummary) StartSummary() {
 			TriggerHook("Summary", summary)
 		case report := <-s.reportChan:
 			s.doWithDataWriteLock(func() {
-				s.Data.Children[report.Address] = report
+				s.ServerSummaryData.Children[report.Address] = report
 			})
 		}
 	}
