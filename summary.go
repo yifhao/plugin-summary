@@ -1,8 +1,11 @@
 package plugin_summary
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	. "github.com/Monibuca/engine/v3"
@@ -14,7 +17,11 @@ import (
 )
 
 // Summary 系统摘要数据
-var Summary ServerSummary
+var Summary = ServerSummary{
+	control:    make(chan bool),
+	reportChan: make(chan *ServerSummaryData),
+}
+
 var config = struct {
 	SampleRate int
 }{1}
@@ -33,13 +40,19 @@ func summary(w http.ResponseWriter, r *http.Request) {
 	sse := NewSSE(w, r.Context())
 	Summary.Add()
 	defer Summary.Done()
-	sse.WriteJSON(&Summary)
+	summaryData, _ := getSummaryDataJson()
+	_, _ = sse.Write(summaryData)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			if err := sse.WriteJSON(&Summary); err != nil {
+			summaryData, err := getSummaryDataJson()
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			if _, err := sse.Write(summaryData); err != nil {
 				log.Println(err)
 				return
 			}
@@ -49,8 +62,27 @@ func summary(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ServerSummary 系统摘要定义
+func getSummaryDataJson() ([]byte, error) {
+	var summaryData []byte
+	var err error
+	Summary.doWithDataReadLock(func() {
+		summaryData, err = json.Marshal(Summary.Data)
+	})
+	return summaryData, err
+}
+
+// ServerSummary 控制器相关, 与具体数据分离
 type ServerSummary struct {
+	ref        int64
+	control    chan bool
+	reportChan chan *ServerSummaryData
+
+	dataRwLock sync.RWMutex
+	Data       ServerSummaryData
+}
+
+// ServerSummaryData 系统摘要定义
+type ServerSummaryData struct {
 	Address string
 	Memory  struct {
 		Total uint64
@@ -68,10 +100,7 @@ type ServerSummary struct {
 	NetWork     []NetWorkInfo
 	Streams     []*Stream
 	lastNetWork []NetWorkInfo
-	ref         int
-	control     chan bool
-	reportChan  chan *ServerSummary
-	Children    map[string]*ServerSummary
+	Children    map[string]*ServerSummaryData
 }
 
 // NetWorkInfo 网速信息
@@ -83,39 +112,61 @@ type NetWorkInfo struct {
 	SentSpeed    uint64
 }
 
-//StartSummary 开始定时采集数据，每秒一次
+// doWithDataReadLock 包装了读锁
+func (s *ServerSummary) doWithDataReadLock(reader func()) {
+	s.dataRwLock.RLock()
+	defer s.dataRwLock.RUnlock()
+	reader()
+}
+
+// doWithDataWriteLock 包装了写锁
+func (s *ServerSummary) doWithDataWriteLock(writer func()) {
+	s.dataRwLock.Lock()
+	defer s.dataRwLock.Unlock()
+	writer()
+}
+
+// StartSummary 开始定时采集数据，每秒一次
 func (s *ServerSummary) StartSummary() {
 	ticker := time.NewTicker(time.Second * time.Duration(config.SampleRate))
-	s.control = make(chan bool)
-	s.reportChan = make(chan *ServerSummary)
 	for {
 		select {
 		case <-ticker.C:
-			if s.ref > 0 {
-				Summary.collect()
+			if atomic.LoadInt64(&s.ref) > 0 {
+				data := Summary.collect()
+				s.doWithDataWriteLock(func() {
+					data.Children = s.Data.Children
+					s.Data = data
+				})
 			}
 		case v := <-s.control:
-			if v {
-				if s.ref++; s.ref == 1 {
-					log.Println("start report summary")
-					TriggerHook("Summary", true)
+			summary := false
+			s.doWithDataWriteLock(func() {
+				if v {
+					if atomic.AddInt64(&s.ref, 1) == 1 {
+						log.Println("start report summary")
+						summary = true
+					}
+				} else {
+					if atomic.AddInt64(&s.ref, -1) == 0 {
+						s.Data.lastNetWork = nil
+						log.Println("stop report summary")
+						summary = false
+					}
 				}
-			} else {
-				if s.ref--; s.ref == 0 {
-					s.lastNetWork = nil
-					log.Println("stop report summary")
-					TriggerHook("Summary", false)
-				}
-			}
+			})
+			TriggerHook("Summary", summary)
 		case report := <-s.reportChan:
-			s.Children[report.Address] = report
+			s.doWithDataWriteLock(func() {
+				s.Data.Children[report.Address] = report
+			})
 		}
 	}
 }
 
 // Running 是否正在采集数据
 func (s *ServerSummary) Running() bool {
-	return s.ref > 0
+	return atomic.LoadInt64(&s.ref) > 0
 }
 
 // Add 增加订阅者
@@ -129,58 +180,60 @@ func (s *ServerSummary) Done() {
 }
 
 // Report 上报数据
-func (s *ServerSummary) Report(slave *ServerSummary) {
+func (s *ServerSummary) Report(slave *ServerSummaryData) {
 	s.reportChan <- slave
 }
-func (s *ServerSummary) collect() {
+
+func (s *ServerSummary) collect() ServerSummaryData {
 	v, _ := mem.VirtualMemory()
-	//c, _ := cpu.Info()
+	// c, _ := cpu.Info()
 	d, _ := disk.Usage("/")
-	//n, _ := host.Info()
+	// n, _ := host.Info()
 	nv, _ := net.IOCounters(true)
-	//boottime, _ := host.BootTime()
-	//btime := time.Unix(int64(boottime), 0).Format("2006-01-02 15:04:05")
-	s.Memory.Total = v.Total / 1024 / 1024
-	s.Memory.Free = v.Available / 1024 / 1024
-	s.Memory.Used = v.Used / 1024 / 1024
-	s.Memory.Usage = v.UsedPercent
-	//fmt.Printf("        Mem       : %v MB  Free: %v MB Used:%v Usage:%f%%\n", v.Total/1024/1024, v.Available/1024/1024, v.Used/1024/1024, v.UsedPercent)
-	//if len(c) > 1 {
+	// boottime, _ := host.BootTime()
+	// btime := time.Unix(int64(boottime), 0).Format("2006-01-02 15:04:05")
+	sd := ServerSummaryData{}
+	sd.Memory.Total = v.Total / 1024 / 1024
+	sd.Memory.Free = v.Available / 1024 / 1024
+	sd.Memory.Used = v.Used / 1024 / 1024
+	sd.Memory.Usage = v.UsedPercent
+	// fmt.Printf("        Mem       : %v MB  Free: %v MB Used:%v Usage:%f%%\n", v.Total/1024/1024, v.Available/1024/1024, v.Used/1024/1024, v.UsedPercent)
+	// if len(c) > 1 {
 	//	for _, sub_cpu := range c {
 	//		modelname := sub_cpu.ModelName
 	//		cores := sub_cpu.Cores
 	//		fmt.Printf("        CPU       : %v   %v cores \n", modelname, cores)
 	//	}
-	//} else {
+	// } else {
 	//	sub_cpu := c[0]
 	//	modelname := sub_cpu.ModelName
 	//	cores := sub_cpu.Cores
 	//	fmt.Printf("        CPU       : %v   %v cores \n", modelname, cores)
-	//}
+	// }
 	if cc, _ := cpu.Percent(time.Second, false); len(cc) > 0 {
-		s.CPUUsage = cc[0]
+		sd.CPUUsage = cc[0]
 	}
-	s.HardDisk.Free = d.Free / 1024 / 1024 / 1024
-	s.HardDisk.Total = d.Total / 1024 / 1024 / 1024
-	s.HardDisk.Used = d.Used / 1024 / 1024 / 1024
-	s.HardDisk.Usage = d.UsedPercent
-	s.NetWork = make([]NetWorkInfo, len(nv))
+	sd.HardDisk.Free = d.Free / 1024 / 1024 / 1024
+	sd.HardDisk.Total = d.Total / 1024 / 1024 / 1024
+	sd.HardDisk.Used = d.Used / 1024 / 1024 / 1024
+	sd.HardDisk.Usage = d.UsedPercent
+	sd.NetWork = make([]NetWorkInfo, len(nv))
 	for i, n := range nv {
-		s.NetWork[i].Name = n.Name
-		s.NetWork[i].Receive = n.BytesRecv
-		s.NetWork[i].Sent = n.BytesSent
-		if s.lastNetWork != nil && len(s.lastNetWork) > i {
-			s.NetWork[i].ReceiveSpeed = n.BytesRecv - s.lastNetWork[i].Receive
-			s.NetWork[i].SentSpeed = n.BytesSent - s.lastNetWork[i].Sent
+		sd.NetWork[i].Name = n.Name
+		sd.NetWork[i].Receive = n.BytesRecv
+		sd.NetWork[i].Sent = n.BytesSent
+		if sd.lastNetWork != nil && len(sd.lastNetWork) > i {
+			sd.NetWork[i].ReceiveSpeed = n.BytesRecv - sd.lastNetWork[i].Receive
+			sd.NetWork[i].SentSpeed = n.BytesSent - sd.lastNetWork[i].Sent
 		}
 	}
-	s.lastNetWork = s.NetWork
-	//fmt.Printf("        Network: %v bytes / %v bytes\n", nv[0].BytesRecv, nv[0].BytesSent)
-	//fmt.Printf("        SystemBoot:%v\n", btime)
-	//fmt.Printf("        CPU Used    : used %f%% \n", cc[0])
-	//fmt.Printf("        HD        : %v GB  Free: %v GB Usage:%f%%\n", d.Total/1024/1024/1024, d.Free/1024/1024/1024, d.UsedPercent)
-	//fmt.Printf("        OS        : %v(%v)   %v  \n", n.Platform, n.PlatformFamily, n.PlatformVersion)
-	//fmt.Printf("        Hostname  : %v  \n", n.Hostname)
-	s.Streams = Streams.ToList()
-	return
+	sd.lastNetWork = sd.NetWork
+	// fmt.Printf("        Network: %v bytes / %v bytes\n", nv[0].BytesRecv, nv[0].BytesSent)
+	// fmt.Printf("        SystemBoot:%v\n", btime)
+	// fmt.Printf("        CPU Used    : used %f%% \n", cc[0])
+	// fmt.Printf("        HD        : %v GB  Free: %v GB Usage:%f%%\n", d.Total/1024/1024/1024, d.Free/1024/1024/1024, d.UsedPercent)
+	// fmt.Printf("        OS        : %v(%v)   %v  \n", n.Platform, n.PlatformFamily, n.PlatformVersion)
+	// fmt.Printf("        Hostname  : %v  \n", n.Hostname)
+	sd.Streams = Streams.ToList()
+	return sd
 }
